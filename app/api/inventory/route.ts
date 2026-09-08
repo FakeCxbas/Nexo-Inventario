@@ -1,25 +1,12 @@
 import { database } from '@/db/raw';
-export async function GET() {
+import { readInventory, privateHeaders } from '@/db/read';
+export async function GET(req: Request) {
   try {
-    const db = database();
-    const result = await db.batch(
-      ['products', 'branches', 'suppliers', 'stock', 'movements'].map((t) =>
-        db.prepare(
-          `SELECT * FROM ${t}${t === 'movements' ? ' ORDER BY created DESC' : ''}`,
-        ),
-      ),
-    );
-    return Response.json(
-      Object.fromEntries(
-        ['products', 'branches', 'suppliers', 'stock', 'movements'].map(
-          (t, i) => [t, result[i].results],
-        ),
-      ),
-    );
+    return await readInventory(req);
   } catch {
     return Response.json(
       { error: 'No se pudo cargar el inventario. Intenta de nuevo.' },
-      { status: 503 },
+      { status: 503, headers: privateHeaders },
     );
   }
 }
@@ -29,10 +16,11 @@ const text = (x: unknown, max = 180) => {
   return x.trim();
 };
 const num = (x: unknown, integer = false) => {
-  const n = Number(x);
+  const n = typeof x === 'number' || typeof x === 'string' ? Number(x) : NaN;
   if (
     x === '' ||
     x === null ||
+    (typeof x === 'string' && !x.trim()) ||
     !Number.isFinite(n) ||
     n < 0 ||
     n > 1e9 ||
@@ -42,14 +30,27 @@ const num = (x: unknown, integer = false) => {
   return n;
 };
 export async function POST(req: Request) {
+  let replayId = '';
+  let replayHash = '';
   try {
     const origin = req.headers.get('origin');
     if (origin && origin !== new URL(req.url).origin)
       return Response.json({ error: 'Origen no permitido' }, { status: 403 });
-    const b = (await req.json()) as Record<string, any>;
+    const raw = await req.text();
+    if (raw.length > 12000) throw Error('Solicitud demasiado grande.');
+    const b = JSON.parse(raw) as Record<string, any>;
+    if (!b || typeof b !== 'object' || Array.isArray(b))
+      throw Error('Solicitud inválida.');
     const db = database();
     let id = crypto.randomUUID();
     if (b.action === 'product') {
+      for (const key of ['cost', 'price']) {
+        const amount = num(b[key]);
+        if (Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-6)
+          throw Error('Los importes admiten hasta dos decimales.');
+      }
+      if (b.expiry && !/^\d{4}-\d{2}-\d{2}$/.test(b.expiry))
+        throw Error('Fecha de vencimiento inválida.');
       const values = [
         text(b.name),
         text(b.sku, 80),
@@ -64,12 +65,29 @@ export async function POST(req: Request) {
       ];
       if (b.id) {
         id = text(b.id);
-        await db
+        const current = await db
+          .prepare('SELECT * FROM products WHERE id=?')
+          .bind(id)
+          .first<any>();
+        if (!current) throw Error('El producto ya no existe.');
+        if (
+          current.unit !== b.unit &&
+          (await db
+            .prepare('SELECT id FROM movements WHERE product=? LIMIT 1')
+            .bind(id)
+            .first())
+        )
+          throw Error(
+            'No se puede cambiar la unidad de un producto con historial. Crea otro SKU.',
+          );
+        const updated = await db
           .prepare(
-            'UPDATE products SET name=?,sku=?,barcode=?,category=?,unit=?,cost=?,price=?,minimum=?,supplier=?,expiry=? WHERE id=?',
+            'UPDATE products SET name=CASE WHEN version=? AND (unit=? OR NOT EXISTS(SELECT 1 FROM movements WHERE product=products.id)) THEN ? ELSE NULL END,sku=?,barcode=?,category=?,unit=?,cost=?,price=?,minimum=?,supplier=?,expiry=?,version=version+1 WHERE id=?',
           )
-          .bind(...values, id)
+          .bind(num(b.version, true), text(b.unit), ...values, id)
           .run();
+        if (!updated.meta.changes)
+          throw Error('El registro ya no existe. Actualiza el inventario.');
       } else
         await db
           .prepare(
@@ -80,10 +98,20 @@ export async function POST(req: Request) {
     } else if (b.action === 'branch') {
       if (b.id) {
         id = text(b.id);
-        await db
-          .prepare('UPDATE branches SET name=?,city=?,kind=? WHERE id=?')
-          .bind(text(b.name), text(b.city), text(b.kind), id)
+        const updated = await db
+          .prepare(
+            'UPDATE branches SET name=CASE WHEN version=? THEN ? ELSE NULL END,city=?,kind=?,version=version+1 WHERE id=?',
+          )
+          .bind(
+            num(b.version, true),
+            text(b.name),
+            text(b.city),
+            text(b.kind),
+            id,
+          )
           .run();
+        if (!updated.meta.changes)
+          throw Error('El registro ya no existe. Actualiza el inventario.');
       } else
         await db
           .prepare('INSERT INTO branches (id,name,city,kind) VALUES (?,?,?,?)')
@@ -92,15 +120,20 @@ export async function POST(req: Request) {
     } else if (b.action === 'supplier') {
       if (b.id) {
         id = text(b.id);
-        await db
-          .prepare('UPDATE suppliers SET name=?,email=?,phone=? WHERE id=?')
+        const updated = await db
+          .prepare(
+            'UPDATE suppliers SET name=CASE WHEN version=? THEN ? ELSE NULL END,email=?,phone=?,version=version+1 WHERE id=?',
+          )
           .bind(
+            num(b.version, true),
             text(b.name),
             String(b.email || '').slice(0, 180),
             String(b.phone || '').slice(0, 80),
             id,
           )
           .run();
+        if (!updated.meta.changes)
+          throw Error('El registro ya no existe. Actualiza el inventario.');
       } else
         await db
           .prepare(
@@ -125,11 +158,49 @@ export async function POST(req: Request) {
         throw Error('Tipo de movimiento inválido.');
       if (q === 0 && type !== 'Conteo')
         throw Error('La cantidad debe ser mayor que cero.');
-      if (
-        await db.prepare('SELECT id FROM movements WHERE id=?').bind(id).first()
-      )
-        return Response.json({ id });
       const destination = type === 'Transferencia' ? text(b.destination) : null;
+      const expectedVersion =
+        type === 'Conteo' ? num(b.expected_version, true) : null;
+      const canonical = JSON.stringify({
+        product,
+        branch,
+        type,
+        quantity: q,
+        note,
+        destination,
+        expectedVersion,
+      });
+      replayId = id;
+      replayHash = Array.from(
+        new Uint8Array(
+          await crypto.subtle.digest(
+            'SHA-256',
+            new TextEncoder().encode(canonical),
+          ),
+        ),
+      )
+        .map((v) => v.toString(16).padStart(2, '0'))
+        .join('');
+      const existing = await db
+        .prepare('SELECT request_hash FROM movements WHERE id=?')
+        .bind(id)
+        .first<{ request_hash: string }>();
+      if (existing) {
+        if (existing.request_hash !== replayHash)
+          throw Error(
+            'La referencia ya fue usada con otros datos. Abre un nuevo movimiento.',
+          );
+        return Response.json(
+          { id, replayed: true },
+          { headers: privateHeaders },
+        );
+      }
+      const item = await db
+        .prepare('SELECT cost FROM products WHERE id=?')
+        .bind(product)
+        .first<{ cost: number }>();
+      if (!item) throw Error('El producto ya no existe.');
+      const costCents = Math.round(item.cost * 100);
       if (destination === branch)
         throw Error('El destino debe ser otra sucursal.');
       const statements = [
@@ -143,27 +214,51 @@ export async function POST(req: Request) {
         statements.push(
           db
             .prepare(
-              'INSERT INTO movements (id,product,branch,destination,type,quantity,note,created) SELECT ?,product,branch,NULL,?,?-quantity,?,? FROM stock WHERE product=? AND branch=?',
+              'INSERT INTO movements (id,product,branch,destination,type,quantity,note,created,request_hash,cost_cents) SELECT ?,product,branch,NULL,?,CASE WHEN version=? THEN ?-quantity ELSE NULL END,?,?,?,? FROM stock WHERE product=? AND branch=?',
             )
-            .bind(id, type, q, note, date, product, branch),
+            .bind(
+              id,
+              type,
+              expectedVersion,
+              q,
+              note,
+              date,
+              replayHash,
+              costCents,
+              product,
+              branch,
+            ),
         );
         statements.push(
           db
-            .prepare('UPDATE stock SET quantity=? WHERE product=? AND branch=?')
+            .prepare(
+              'UPDATE stock SET quantity=?,version=version+1 WHERE product=? AND branch=?',
+            )
             .bind(q, product, branch),
         );
       } else {
         statements.push(
           db
             .prepare(
-              'INSERT INTO movements (id,product,branch,destination,type,quantity,note,created) VALUES (?,?,?,?,?,?,?,?)',
+              'INSERT INTO movements (id,product,branch,destination,type,quantity,note,created,request_hash,cost_cents) VALUES (?,?,?,?,?,?,?,?,?,?)',
             )
-            .bind(id, product, branch, destination, type, q, note, date),
+            .bind(
+              id,
+              product,
+              branch,
+              destination,
+              type,
+              q,
+              note,
+              date,
+              replayHash,
+              costCents,
+            ),
         );
         statements.push(
           db
             .prepare(
-              'UPDATE stock SET quantity=quantity+? WHERE product=? AND branch=?',
+              'UPDATE stock SET quantity=quantity+?,version=version+1 WHERE product=? AND branch=?',
             )
             .bind(type === 'Entrada' ? q : -q, product, branch),
         );
@@ -171,7 +266,7 @@ export async function POST(req: Request) {
           statements.push(
             db
               .prepare(
-                'INSERT INTO stock (product,branch,quantity) VALUES (?,?,?) ON CONFLICT(product,branch) DO UPDATE SET quantity=quantity+excluded.quantity',
+                'INSERT INTO stock (product,branch,quantity) VALUES (?,?,?) ON CONFLICT(product,branch) DO UPDATE SET quantity=quantity+excluded.quantity,version=version+1',
               )
               .bind(product, destination, q),
           );
@@ -298,14 +393,14 @@ export async function POST(req: Request) {
         ...bs.map((v) =>
           db
             .prepare(
-              'INSERT INTO branches VALUES (?,?,?,?) ON CONFLICT DO NOTHING',
+              'INSERT INTO branches (id,name,city,kind) VALUES (?,?,?,?) ON CONFLICT DO NOTHING',
             )
             .bind(...v),
         ),
         ...ss.map((v) =>
           db
             .prepare(
-              'INSERT INTO suppliers VALUES (?,?,?,?) ON CONFLICT DO NOTHING',
+              'INSERT INTO suppliers (id,name,email,phone) VALUES (?,?,?,?) ON CONFLICT DO NOTHING',
             )
             .bind(...v),
         ),
@@ -330,11 +425,17 @@ export async function POST(req: Request) {
             [120, 36, 42, 24],
           ][i][j];
           stmts.push(
-            db.prepare('INSERT INTO stock VALUES (?,?,?)').bind(p[0], b[0], q),
+            db
+              .prepare(
+                'INSERT INTO stock (product,branch,quantity) VALUES (?,?,?)',
+              )
+              .bind(p[0], b[0], q),
           );
           stmts.push(
             db
-              .prepare('INSERT INTO movements VALUES (?,?,?,NULL,?,?,?,?)')
+              .prepare(
+                'INSERT INTO movements (id,product,branch,destination,type,quantity,note,created) VALUES (?,?,?,NULL,?,?,?,?)',
+              )
               .bind(
                 crypto.randomUUID(),
                 p[0],
@@ -349,20 +450,40 @@ export async function POST(req: Request) {
       );
       await db.batch(stmts);
     } else throw Error('Acción no válida.');
-    return Response.json({ id });
+    return Response.json({ id }, { headers: privateHeaders });
   } catch (e) {
+    if (replayId && replayHash) {
+      try {
+        const existing = await database()
+          .prepare('SELECT request_hash FROM movements WHERE id=?')
+          .bind(replayId)
+          .first<{ request_hash: string }>();
+        if (existing?.request_hash === replayHash)
+          return Response.json(
+            { id: replayId, replayed: true },
+            { headers: privateHeaders },
+          );
+      } catch {}
+    }
     const message = String(e);
-    const error = message.includes('nonnegative_stock')
-      ? 'Stock insuficiente. Revisa las existencias de la sucursal de origen.'
-      : message.includes('UNIQUE')
-        ? 'Ya existe un producto con ese SKU.'
-        : message.includes('FOREIGN KEY')
-          ? 'El producto, proveedor o sucursal no existe.'
-          : message.includes('D1_')
-            ? 'No se pudo guardar la operación. Vuelve a intentarlo.'
-            : e instanceof Error
-              ? e.message
-              : 'No se pudo guardar.';
-    return Response.json({ error }, { status: 400 });
+    const conflict =
+      message.includes('NOT NULL') || message.includes('otros datos');
+    const error = conflict
+      ? 'Los datos cambiaron desde que abriste el formulario. Ciérralo, actualiza y vuelve a intentarlo.'
+      : message.includes('nonnegative_stock')
+        ? 'Stock insuficiente. Revisa las existencias de la sucursal de origen.'
+        : message.includes('UNIQUE')
+          ? 'Ya existe un producto con ese SKU.'
+          : message.includes('FOREIGN KEY')
+            ? 'El producto, proveedor o sucursal no existe.'
+            : message.includes('D1_')
+              ? 'No se pudo guardar la operación. Vuelve a intentarlo.'
+              : e instanceof Error
+                ? e.message
+                : 'No se pudo guardar.';
+    return Response.json(
+      { error },
+      { status: conflict ? 409 : 400, headers: privateHeaders },
+    );
   }
 }

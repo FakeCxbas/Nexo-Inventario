@@ -99,6 +99,9 @@ await post({
   product: p.id,
   branch: a.id,
   type: 'Conteo',
+  expected_version: (await state()).stock.find(
+    (s) => s.product === p.id && s.branch === a.id,
+  ).version,
   quantity: 5,
   note: 'Prueba conteo',
 });

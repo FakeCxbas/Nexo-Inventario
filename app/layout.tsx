@@ -14,6 +14,9 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: 'Nexo · Inventario',
+  manifest: '/manifest.webmanifest',
+  appleWebApp: { capable: true, statusBarStyle: 'default', title: 'Nexo' },
+  icons: { icon: '/favicon.svg', apple: '/icons/nexo-192.png' },
   description:
     'Control de inventario, sucursales y movimientos en un solo lugar.',
 };

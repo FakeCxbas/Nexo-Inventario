@@ -1,6 +1,7 @@
 'use client';
-import { useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useEffect, useMemo, useState, useRef, type FormEvent } from 'react';
 import {
+  ShieldCheck,
   Package,
   LayoutDashboard,
   ArrowLeftRight,
@@ -60,6 +61,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table';
+import { ControlCenter, MovementHistory } from '@/components/nexo/operations';
 import { Progress } from '@/components/ui/progress';
 import {
   AreaChart,
@@ -99,8 +101,21 @@ type Data = {
   products: Product[];
   branches: Branch[];
   suppliers: Supplier[];
-  stock: { product: string; branch: string; quantity: number }[];
+  stock: {
+    product: string;
+    branch: string;
+    quantity: number;
+    version: number;
+  }[];
   movements: Movement[];
+  revision: number;
+  daily: {
+    day: string;
+    type: string;
+    branch: string;
+    destination: string | null;
+    quantity: number;
+  }[];
 };
 const empty: Data = {
   products: [],
@@ -108,6 +123,8 @@ const empty: Data = {
   suppliers: [],
   stock: [],
   movements: [],
+  revision: 0,
+  daily: [],
 };
 const nav = [
   [LayoutDashboard, 'Resumen'],
@@ -116,6 +133,7 @@ const nav = [
   [Warehouse, 'Sucursales'],
   [Truck, 'Proveedores'],
   [ChartNoAxesCombined, 'Reportes'],
+  [ShieldCheck, 'Control'],
 ] as const;
 const categories = [
   'Alimentos',
@@ -232,26 +250,82 @@ export default function Home() {
     [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(true),
     [notice, setNotice] = useState(''),
-    [connection, setConnection] = useState(false);
-  async function refresh() {
+    [connection, setConnection] = useState(false),
+    [syncError, setSyncError] = useState(''),
+    [lastSync, setLastSync] = useState('');
+  const revisionRef = useRef<number | null>(null),
+    requestRef = useRef<Promise<boolean> | null>(null);
+  async function refresh(force = false): Promise<boolean> {
+    if (requestRef.current) {
+      await requestRef.current;
+      if (force) return refresh(true);
+      return true;
+    }
+    const task = (async () => {
+      try {
+        const r = await fetch(
+          '/api/inventory' +
+            (!force && revisionRef.current !== null
+              ? '?since=' + revisionRef.current
+              : ''),
+          { cache: 'no-store' },
+        );
+        const j = (await r.json()) as Data & {
+          error?: string;
+          unchanged?: boolean;
+        };
+        if (!r.ok) throw Error(j.error || 'No se pudo actualizar');
+        if (!j.unchanged) {
+          setData(j);
+          revisionRef.current = j.revision;
+        }
+        setConnection(true);
+        setSyncError('');
+        setLastSync(
+          new Date().toLocaleTimeString('es-EC', {
+            hour: '2-digit',
+            minute: '2-digit',
+            second: '2-digit',
+          }),
+        );
+        return true;
+      } catch (e) {
+        setSyncError(e instanceof Error ? e.message : 'No se pudo conectar');
+        setConnection(false);
+        return false;
+      } finally {
+        setLoading(false);
+      }
+    })();
+    requestRef.current = task;
     try {
-      const r = await fetch('/api/inventory');
-      const j = (await r.json()) as Data & { error?: string };
-      if (!r.ok) throw Error(j.error || 'No se pudo completar la operación');
-      setData(j);
-      setConnection(true);
-      setError('');
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'No se pudo conectar.');
-      setConnection(false);
+      return await task;
     } finally {
-      setLoading(false);
+      requestRef.current = null;
     }
   }
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 30000);
-    return () => clearInterval(timer);
+    const update = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine)
+        void refresh();
+    };
+    const offline = () => {
+      setConnection(false);
+      setSyncError(
+        'Sin conexión. Los saldos pueden estar desactualizados; los movimientos no se enviarán.',
+      );
+    };
+    const timer = setInterval(update, 60000);
+    document.addEventListener('visibilitychange', update);
+    window.addEventListener('online', update);
+    window.addEventListener('offline', offline);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', update);
+      window.removeEventListener('online', update);
+      window.removeEventListener('offline', offline);
+    };
   }, []);
   useEffect(() => {
     if (!notice) return;
@@ -305,14 +379,17 @@ export default function Home() {
     data.stock
       .filter((s) => s.product === id && (b === 'all' || s.branch === b))
       .reduce((n, s) => n + s.quantity, 0);
+  const low = (p: Product) =>
+    branch === 'all'
+      ? data.branches.some((b) => qty(p.id, b.id) <= p.minimum)
+      : qty(p.id) <= p.minimum;
   const rows = data.products.filter(
     (p) =>
       (p.name + ' ' + p.sku + ' ' + p.barcode)
         .toLowerCase()
         .includes(search.toLowerCase()) &&
       (category === 'all' || p.category === category) &&
-      (status === 'all' ||
-        (status === 'low' ? qty(p.id) <= p.minimum : qty(p.id) > p.minimum)),
+      (status === 'all' || (status === 'low' ? low(p) : !low(p))),
   );
   const stocks = data.stock.filter(
     (s) => branch === 'all' || s.branch === branch,
@@ -321,7 +398,11 @@ export default function Home() {
     value = stocks.reduce(
       (n, s) =>
         n +
-        s.quantity * (data.products.find((p) => p.id === s.product)?.cost || 0),
+        (s.quantity *
+          Math.round(
+            (data.products.find((p) => p.id === s.product)?.cost || 0) * 100,
+          )) /
+          100,
       0,
     );
   const alerts = data.branches
@@ -355,9 +436,9 @@ export default function Home() {
         const d = new Date();
         d.setDate(d.getDate() - Number(period) + 1 + i);
         const key = d.toISOString().slice(0, 10);
-        const ms = data.movements.filter(
+        const ms = data.daily.filter(
           (m) =>
-            m.created.startsWith(key) &&
+            m.day === key &&
             (branch === 'all' ||
               m.branch === branch ||
               m.destination === branch),
@@ -375,7 +456,7 @@ export default function Home() {
             .reduce((n, m) => n + m.quantity, 0),
         };
       }),
-    [data.movements, period, branch],
+    [data.daily, period, branch],
   );
   const bName = (id: string | null) =>
     data.branches.find((b) => b.id === id)?.name || '—';
@@ -401,10 +482,20 @@ export default function Home() {
             supplier: '',
             quantity: '1',
             id: crypto.randomUUID(),
+            expected_version: String(
+              data.stock.find(
+                (s) =>
+                  s.product === data.products[0]?.id &&
+                  s.branch ===
+                    (branch === 'all' ? data.branches[0]?.id : branch),
+              )?.version || 0,
+            ),
           },
     );
   }
   async function mutate(body: object) {
+    if (!navigator.onLine)
+      throw Error('No hay conexión. No se envió la operación.');
     const r = await fetch('/api/inventory', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -412,7 +503,7 @@ export default function Home() {
     });
     const j = (await r.json()) as { id?: string; error?: string };
     if (!r.ok) throw Error(j.error || 'No se pudo completar la operación');
-    await refresh();
+    await refresh(true);
     return j;
   }
   async function submit(e: FormEvent) {
@@ -430,7 +521,7 @@ export default function Home() {
         delete (payload as any).id;
       await mutate(payload);
       setModal(null);
-      setNotice('Guardado. El inventario está actualizado.');
+      setNotice('Operación confirmada por el servidor.');
     } catch (e) {
       setError(e instanceof Error ? e.message : 'No se pudo guardar.');
     } finally {
@@ -448,7 +539,23 @@ export default function Home() {
       setBusy(false);
     }
   }
-  function download() {
+  async function download() {
+    let exportMoves = moves;
+    if (view === 'Movimientos') {
+      try {
+        const r = await fetch(
+          '/api/inventory?' +
+            new URLSearchParams({ mode: 'history_export', branch, search }),
+          { cache: 'no-store' },
+        );
+        const j = (await r.json()) as any;
+        if (!r.ok) throw Error(j.error);
+        exportMoves = j.rows;
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'No se pudo exportar');
+        return;
+      }
+    }
     const csvCell = (v: unknown) =>
       '"' +
       String(v ?? '')
@@ -494,7 +601,7 @@ export default function Home() {
         : view === 'Proveedores'
           ? data.suppliers.map((s) => [s.name, s.email, s.phone])
           : view === 'Movimientos'
-            ? moves.map((m) => [
+            ? exportMoves.map((m) => [
                 m.created,
                 m.type,
                 data.products.find((p) => p.id === m.product)?.name,
@@ -564,7 +671,24 @@ export default function Home() {
         {label}
         <Picker
           value={form[name] || ''}
-          onChange={(v) => setForm({ ...form, [name]: v })}
+          onChange={(v) =>
+            setForm({
+              ...form,
+              [name]: v,
+              ...(['product', 'branch'].includes(name)
+                ? {
+                    expected_version: String(
+                      data.stock.find(
+                        (s) =>
+                          s.product ===
+                            (name === 'product' ? v : form.product) &&
+                          s.branch === (name === 'branch' ? v : form.branch),
+                      )?.version || 0,
+                    ),
+                  }
+                : {}),
+            })
+          }
           options={options}
           label={label}
         />
@@ -619,17 +743,13 @@ export default function Home() {
                 <span
                   className={
                     'badge ' +
-                    (qty(p.id) === 0
-                      ? 'red'
-                      : qty(p.id) <= p.minimum
-                        ? 'amber'
-                        : 'green')
+                    (qty(p.id) === 0 ? 'red' : low(p) ? 'amber' : 'green')
                   }
                 >
                   <i />
                   {qty(p.id) === 0
                     ? 'Agotado'
-                    : qty(p.id) <= p.minimum
+                    : low(p)
                       ? 'Stock bajo'
                       : 'Disponible'}
                 </span>
@@ -750,6 +870,8 @@ export default function Home() {
                       'Conecta tus tiendas y centros de distribución.',
                     Proveedores:
                       'Tus aliados de abastecimiento, en un solo lugar.',
+                    Control:
+                      'Verifica saldos, revisa cambios y conserva una copia de tu operación.',
                     Reportes:
                       'Información de tu inventario para tomar mejores decisiones.',
                   }[view]
@@ -757,7 +879,7 @@ export default function Home() {
               </p>
             </div>
             <div className="heading-actions">
-              {view !== 'Resumen' && (
+              {view !== 'Resumen' && view !== 'Control' && (
                 <button className="secondary" onClick={download}>
                   <Download size={16} />
                   <span>Exportar</span>
@@ -788,9 +910,9 @@ export default function Home() {
               </button>
             </div>
           </div>
-          {error && !modal && (
+          {(error || syncError) && !modal && (
             <div className="error-banner" role="alert">
-              {error}
+              {error || syncError}
               <button onClick={() => void refresh()}>
                 <RefreshCw size={15} /> Reintentar
               </button>
@@ -805,7 +927,8 @@ export default function Home() {
               label="Filtrar sucursal"
             />
             <span>
-              <span className="mini-dot" /> Actualización automática cada 30 s
+              <span className="mini-dot" />{' '}
+              {connection ? 'Actualizado ' + lastSync : 'Sin sincronizar'}
             </span>
           </div>
           {data.products.some((p) => p.id === 'p1') && (
@@ -889,7 +1012,7 @@ export default function Home() {
                   <div className="panel-heading">
                     <div>
                       <h2>Movimiento de inventario</h2>
-                      <p>Unidades recibidas y despachadas</p>
+                      <p>Entradas y salidas externas · días en UTC</p>
                     </div>
                     <Picker
                       value={period}
@@ -1102,6 +1225,13 @@ export default function Home() {
               )}
             </>
           )}
+          {view === 'Control' && (
+            <ControlCenter
+              products={data.products}
+              branches={data.branches}
+              revision={data.revision}
+            />
+          )}
           {view === 'Inventario' && (
             <section className="panel">
               <div className="filters">
@@ -1183,105 +1313,15 @@ export default function Home() {
                   />
                 </div>
                 <span className="subtle">
-                  {moves.length} movimientos registrados
+                  Historial con búsqueda en todos los registros
                 </span>
               </div>
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    {[
-                      'Movimiento',
-                      'Producto',
-                      'Sucursal / destino',
-                      'Cantidad',
-                      'Referencia',
-                      'Fecha',
-                    ].map((h) => (
-                      <TableHead key={h}>{h}</TableHead>
-                    ))}
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {moves.slice((page - 1) * 15, page * 15).map((m) => (
-                    <TableRow key={m.id}>
-                      <TableCell>
-                        <span
-                          className={
-                            'movement-type ' +
-                            (m.type === 'Entrada'
-                              ? 'green-text'
-                              : m.type === 'Salida'
-                                ? 'amber-text'
-                                : '')
-                          }
-                        >
-                          <ArrowLeftRight size={16} />
-                          {m.type}
-                        </span>
-                      </TableCell>
-                      <TableCell>
-                        {data.products.find((p) => p.id === m.product)?.name}
-                      </TableCell>
-                      <TableCell>
-                        {bName(m.branch)}
-                        {m.destination && (
-                          <small className="unit-label">
-                            → {bName(m.destination)}
-                          </small>
-                        )}
-                      </TableCell>
-                      <TableCell>
-                        <b>
-                          {m.type === 'Salida'
-                            ? '-'
-                            : m.type === 'Entrada'
-                              ? '+'
-                              : ''}
-                          {integer(m.quantity)}
-                        </b>
-                      </TableCell>
-                      <TableCell className="note-cell">{m.note}</TableCell>
-                      <TableCell>
-                        <span className="date-cell">
-                          {new Date(m.created).toLocaleString('es-EC', {
-                            day: '2-digit',
-                            month: 'short',
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
-                        </span>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-              {!moves.length && (
-                <div className="empty-state">
-                  <ArrowLeftRight />
-                  <h2>No hay movimientos</h2>
-                  <p>Registra una entrada para recibir existencias.</p>
-                </div>
-              )}
-              <div className="table-footer">
-                <span>Historial de operaciones</span>
-                <div className="pagination">
-                  <button
-                    disabled={page === 1}
-                    onClick={() => setPage(page - 1)}
-                  >
-                    Anterior
-                  </button>
-                  <span>
-                    {page} / {Math.max(1, Math.ceil(moves.length / 15))}
-                  </span>
-                  <button
-                    disabled={page * 15 >= moves.length}
-                    onClick={() => setPage(page + 1)}
-                  >
-                    Siguiente
-                  </button>
-                </div>
-              </div>
+              <MovementHistory
+                branch={branch}
+                search={search}
+                branches={data.branches}
+                revision={data.revision}
+              />
             </section>
           )}
           {view === 'Sucursales' && (
@@ -1549,7 +1589,7 @@ export default function Home() {
                       Existencia actual:{' '}
                       <b>{qty(form.product, form.branch)} unidades</b>.{' '}
                       {form.type === 'Conteo'
-                        ? 'El conteo sustituye la existencia actual y registra la diferencia.'
+                        ? 'El conteo registra la diferencia. Si el saldo cambió desde que abriste este formulario, se rechazará para evitar sobrescribir otra operación.'
                         : 'La operación se guarda al confirmar.'}
                     </p>
                     {(!data.products.length || !data.branches.length) && (
@@ -1598,6 +1638,7 @@ export default function Home() {
                   className="primary"
                   disabled={
                     busy ||
+                    !connection ||
                     (modal === 'movement' &&
                       (!data.products.length || !data.branches.length))
                   }
@@ -1634,6 +1675,11 @@ export default function Home() {
                         branch: b.id,
                         type: 'Entrada',
                         quantity: String(Math.max(1, p.minimum - q)),
+                        expected_version: String(
+                          data.stock.find(
+                            (s) => s.product === p.id && s.branch === b.id,
+                          )?.version || 0,
+                        ),
                         note: 'Reposición de inventario',
                       }));
                     }}
